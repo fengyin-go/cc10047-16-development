@@ -59,7 +59,7 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(self, entry_id: int, action: str, **_kwargs: Any) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
@@ -70,6 +70,11 @@ class BaseModuleService:
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
         return entry, f"{self.ENTITY}已{action}"
+
+    def action_response(self, entry_id: int, action: str, payload: Any = None) -> dict[str, Any]:
+        """资源路由使用的完整动作响应；子类可覆盖以携带 conflict/receipt 等富字段。"""
+        entry, message = self.run_action(entry_id, action, payload=payload)
+        return {"ok": entry is not None, "message": message, "entry": entry}
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

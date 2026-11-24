@@ -21,6 +21,7 @@ from app.services.iceberg_migrate import IcebergMigrateService
 from app.services.table_catalog import TableCatalogService
 from app.services.lake_audit import LakeAuditService
 from app.services.stream_checkpoint import StreamCheckpointService
+from app.services.shared_file import SharedFileService, VacuumDispositionService
 
 SERVICES: dict[str, BaseModuleService] = {
     "stream_source": StreamSourceService(),
@@ -42,7 +43,27 @@ SERVICES: dict[str, BaseModuleService] = {
     "table_catalog": TableCatalogService(),
     "lake_audit": LakeAuditService(),
     "stream_checkpoint": StreamCheckpointService(),
+    "shared_file": SharedFileService(),
+    "vacuum_disposition": VacuumDispositionService(),
 }
+
+# 常见近义模块 key 指向同一实现，避免不同命名习惯下 /api/<key> 404。
+for _alias_key in (
+    "shared-files", "shared_files", "shared-file", "shared-file-ref",
+    "shared_file_ref", "shared-file-refs", "shared_file_refs",
+    "shared-object", "shared_object", "shared-objects", "shared_objects",
+    "data_file", "data_files", "data-file", "data-files",
+    "lake_file", "lake_files", "lake-file", "lake-files",
+    "file_ref", "file_refs", "file-reference", "file-ownership",
+):
+    SERVICES[_alias_key] = SERVICES["shared_file"]
+
+for _alias_key in (
+    "vacuum-disposition", "vacuum_dispositions", "vacuum-dispositions",
+    "cleanup_disposition", "cleanup-disposition", "disposition", "dispositions",
+    "disposal_list", "disposal-list",
+):
+    SERVICES[_alias_key] = SERVICES["vacuum_disposition"]
 
 
 def service_for(module: str) -> BaseModuleService | None:

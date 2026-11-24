@@ -272,3 +272,161 @@ def delta_reconciler(
 
 def _compute_checksum(data: str) -> str:
     return hashlib.md5(data.encode()).hexdigest()[:12]
+
+
+# ------------------------------------------------------------------
+# 共享文件引用校验 / 可释放范围
+# ------------------------------------------------------------------
+#
+# 对象身份一律以 ``object_id`` + ``checksum``（或对象存储 version_id）为准，
+# 不能只看 ``path``：同一路径可能被覆盖成另一个对象，原表与克隆也可能持有
+# 路径相同但身份不同的文件。
+
+
+def _ref_object_id(ref: dict[str, Any]) -> str:
+    return str(ref.get("object_id") or ref.get("对象标识") or ref.get("id") or "")
+
+
+def shared_file_reference_check(
+    objects: list[dict[str, Any]],
+    refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """按对象身份汇总引用归属，并标记“路径相同但对象身份不同”的情况。
+
+    返回每个对象的引用方列表、被哪些有效（已发布/可用）快照持有、以及
+    同路径异身份的配对。纯函数，便于单元测试直接调用。
+    """
+    object_index = {str(o.get("object_id") or o.get("对象标识")): o for o in objects}
+    by_object: dict[str, list[dict[str, Any]]] = {}
+    for ref in refs:
+        oid = _ref_object_id(ref)
+        if not oid:
+            continue
+        by_object.setdefault(oid, []).append(ref)
+
+    items: list[dict[str, Any]] = []
+    for oid, obj in object_index.items():
+        obj_refs = by_object.get(oid, [])
+        valid_holders = [
+            r for r in obj_refs
+            if r.get("snapshot_valid", r.get("published", False))
+        ]
+        tables = sorted({str(r.get("table")) for r in obj_refs if r.get("table")})
+        items.append({
+            "object_id": oid,
+            "path": obj.get("path") or obj.get("存储路径"),
+            "checksum": obj.get("checksum") or obj.get("内容校验"),
+            "identity_key": obj.get("identity_key")
+            or f"{oid}:{obj.get('checksum') or obj.get('内容校验') or ''}",
+            "refs": obj_refs,
+            "tables": tables,
+            "shared_between_tables": len(tables) > 1,
+            "held_by_valid_snapshot": len(valid_holders) > 0,
+            "valid_holders": valid_holders,
+        })
+
+    # 同一路径下出现多个不同对象身份 —— 路径不能作为归属依据。
+    path_groups: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        if item.get("path"):
+            path_groups.setdefault(str(item["path"]), []).append(item)
+    same_path_distinct_identity = []
+    for path, group in path_groups.items():
+        identities = {str(i["identity_key"]) for i in group}
+        if len(identities) > 1:
+            same_path_distinct_identity.append({
+                "path": path,
+                "object_ids": [i["object_id"] for i in group],
+                "identity_keys": sorted(identities),
+                "warning": "同一路径对应多个对象身份，必须按 object_id/checksum 判定引用归属",
+            })
+
+    return {
+        "object_count": len(object_index),
+        "ref_count": len(refs),
+        "items": items,
+        "same_path_distinct_identity": same_path_distinct_identity,
+        "identity_policy": "object_id+checksum",
+    }
+
+
+def releasable_range_planner(
+    table: str,
+    objects: list[dict[str, Any]],
+    refs: list[dict[str, Any]],
+    *,
+    clone_tables: list[str] | None = None,
+    pending_object_ids: set[str] | list[str] | None = None,
+) -> dict[str, Any]:
+    """按湖表 + 有效快照计算共享文件的可释放范围。
+
+    判定规则：
+    1. 只统计引用 ``table`` 的记录；克隆表（``clone_tables``）的有效快照
+       引用同样会阻止释放（已发布克隆持有的文件不能释放）。
+    2. 只有 *有效/已发布* 快照的引用才算持有；未发布的草稿引用不保护对象。
+    3. 对象身份按 object_id/checksum，路径相同不等于同一对象。
+    4. ``pending_object_ids`` 是已经被有效处置清单领取、尚待物理释放的对象，
+       单独标记为 pending_delete，供发布/恢复读取。
+    """
+    clones = set(clone_tables or [])
+    family = {table} | clones
+    pending = set(pending_object_ids or [])
+    object_index = {str(o.get("object_id") or o.get("对象标识")): o for o in objects}
+    check = shared_file_reference_check(objects, refs)
+
+    releasable: list[dict[str, Any]] = []
+    retained: list[dict[str, Any]] = []
+    pending_delete: list[dict[str, Any]] = []
+    already_released: list[dict[str, Any]] = []
+
+    for item in check["items"]:
+        oid = item["object_id"]
+        family_refs = [r for r in item["refs"] if r.get("table") in family]
+        valid_family_refs = [
+            r for r in family_refs
+            if r.get("snapshot_valid", r.get("published", False))
+        ]
+        clone_holders = [
+            r for r in valid_family_refs if r.get("table") in clones
+        ]
+        entry = {
+            "object_id": oid,
+            "path": item["path"],
+            "checksum": item["checksum"],
+            "referenced_by": family_refs,
+            "held_by_clone": bool(clone_holders),
+            "clone_holders": clone_holders,
+        }
+        raw_obj = object_index.get(oid, {})
+        if raw_obj.get("physical_state") == "released":
+            entry["state"] = "already_released"
+            already_released.append(entry)
+            continue
+        if oid in pending:
+            entry["state"] = "pending_delete"
+            pending_delete.append(entry)
+        if valid_family_refs:
+            reasons = []
+            own = [r for r in valid_family_refs if r.get("table") == table]
+            if own:
+                reasons.append("referenced_by_valid_snapshot")
+            if clone_holders:
+                reasons.append("held_by_published_clone")
+            entry["retain_reasons"] = reasons
+            retained.append(entry)
+        else:
+            entry["releasable"] = True
+            releasable.append(entry)
+
+    return {
+        "table": table,
+        "clone_tables": sorted(clones),
+        "range_object_ids": [e["object_id"] for e in releasable],
+        "releasable": releasable,
+        "retained": retained,
+        "pending_delete": pending_delete,
+        "already_released": already_released,
+        "pending_object_ids": sorted(pending),
+        "same_path_distinct_identity": check["same_path_distinct_identity"],
+        "identity_policy": "object_id+checksum",
+    }
